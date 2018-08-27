@@ -18,7 +18,7 @@ function findRoundTripCount(size, cnt = 1) {
   if (size < budget) {
     return cnt
   }
-  return findRoundTripCount(size, cnt)
+  return findRoundTripCount(size, cnt + 1)
 }
 
 async function analyzeFile(file, { baseDir }) {
