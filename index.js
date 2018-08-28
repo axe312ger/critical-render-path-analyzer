@@ -1,13 +1,18 @@
 const { join, basename, dirname, extname } = require('path')
+const { resolve } = require('url')
 
 const chalk = require('chalk')
 const cheerio = require('cheerio')
 const Table = require('cli-table3')
 const fs = require('fs-extra')
 const gzipSize = require('gzip-size')
+const Listr = require('listr')
 const prettyBytes = require('pretty-bytes')
-const ora = require('ora')
 const recursive = require('recursive-readdir')
+const slugify = require('slugify')
+
+const server = require('./server')
+const lighthouse = require('./lighthouse')
 
 const DEFAULT_ROUND_TRIP_SIZE = (1500 - 100) * 10
 const DEFAULT_HEADER_SIZE = 4000
@@ -21,8 +26,16 @@ function findRoundTripCount(size, cnt = 1) {
   return findRoundTripCount(size, cnt + 1)
 }
 
+function getRelativePath(file, baseDir) {
+  const dir = dirname(file)
+    .replace(baseDir, '')
+    .replace('\\', '/')
+  const name = basename(file)
+  return resolve(dir + '/', name)
+}
+
 async function analyzeFile(file, { baseDir }) {
-  const name = join(dirname(file).replace(baseDir, ''), basename(file))
+  const path = getRelativePath(file, baseDir)
   const size = await gzipSize.file(file)
   const roundTrips = findRoundTripCount(size, 1)
 
@@ -70,11 +83,14 @@ async function analyzeFile(file, { baseDir }) {
     analysis.push('✅ no blocking css')
   }
 
+  const result = await lighthouse(resolve(`http://localhost:3000/`, path))
+
   return {
-    name,
+    path,
     size,
     roundTrips,
-    analysis
+    analysis,
+    lighthouse: result
   }
 }
 
@@ -94,53 +110,89 @@ function getRank(roundTrips) {
 }
 
 async function analyzePath({ baseDir, basePath }) {
-  // Find all html files
-  const files = await recursive(baseDir)
+  const tasks = new Listr([
+    {
+      title: 'Locate HTML files',
+      task: async (ctx, task) => {
+        const files = await recursive(baseDir)
 
-  const htmlFiles = files
-    .filter(file => extname(file) === '.html')
-    .sort((a, b) => {
-      const dirnameA = dirname(a)
-      const dirnameB = dirname(b)
-      const nameA = basename(a)
-      const nameB = basename(b)
+        const htmlFiles = files
+          // Drop non-html files
+          .filter(file => extname(file) === '.html')
+          // Sort by dir & filename
+          .sort((a, b) => {
+            const dirnameA = dirname(a)
+            const dirnameB = dirname(b)
+            const nameA = basename(a)
+            const nameB = basename(b)
 
-      if (dirnameA === dirnameB) {
-        return nameA.localeCompare(nameB)
+            if (dirnameA === dirnameB) {
+              return nameA.localeCompare(nameB)
+            }
+
+            return dirnameA.localeCompare(dirnameB)
+          })
+
+        if (!htmlFiles.length) {
+          throw new Error(`⚠️  No HTML files found in ${baseDir}`)
+        }
+
+        ctx.htmlFiles = htmlFiles
       }
+    },
+    {
+      title: `Starting local http server`,
+      task: async (ctx, task) => {
+        ctx.server = await server({ baseDir })
+      }
+    },
+    {
+      title: `Analysing files...`,
+      task: async (ctx, task) => {
+        const { htmlFiles } = ctx
+        ctx.results = {}
+        for await (const file of htmlFiles) {
+          const nr = Object.keys(ctx.results).length + 1
+          const length = htmlFiles.length
+          const path = getRelativePath(file, baseDir)
 
-      return dirnameA.localeCompare(dirnameB)
+          task.title = `${nr}/${length}: ${path}`
+          const results = await analyzeFile(file, { baseDir })
+          ctx.results[file] = results
+          await fs.writeFile(
+            join(__dirname, 'results', `${slugify(path)}.json`),
+            JSON.stringify(results, null, 2)
+          )
+        }
+      }
+    }
+  ])
+
+  try {
+    const ctx = await tasks.run()
+
+    const { results, server } = ctx
+
+    // Stop server
+    server.close()
+
+    // Print result table
+    const table = new Table({
+      head: ['Path', 'File Size', 'TCP round trips', 'Analysis']
     })
 
-  if (!htmlFiles.length) {
-    console.log(`⚠️  No HTML files found in ${baseDir}`)
-    return
+    for (const file in results) {
+      const { path, size, roundTrips, analysis } = results[file]
+      const prettySize = prettyBytes(size)
+      const rank = getRank(roundTrips)
+      table.push([path, prettySize, rank, analysis.join('\n')])
+    }
+
+    console.log(chalk.bold('\nHTML payload analysis:'))
+    console.log(table.toString())
+  } catch (err) {
+    console.error(err)
   }
-
-  const spinner = ora(`Analysing ${htmlFiles.length} files...`)
-
-  // Analyze
-  const results = {}
-  for await (const file of htmlFiles) {
-    results[file] = await analyzeFile(file, { baseDir })
-  }
-
-  spinner.succeed()
-
-  // Print result table
-  const table = new Table({
-    head: ['File', 'File Size', 'TCP round trips', 'Analysis']
-  })
-
-  for (const file in results) {
-    const { name, size, roundTrips, analysis } = results[file]
-    const prettySize = prettyBytes(size)
-    const rank = getRank(roundTrips)
-    table.push([name, prettySize, rank, analysis.join('\n')])
-  }
-
-  console.log(chalk.bold('\nHTML payload analysis:'))
-  console.log(table.toString())
 }
 
 module.exports = analyzePath
